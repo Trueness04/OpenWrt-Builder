@@ -62,6 +62,18 @@ jobs:
           SECRET_PPPOE_PASS: ${{ secrets.PPPOE_PASS }}
           SECRET_SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
           
+      - name: Validate selected defaults without printing credentials
+        env:
+          SELECTED_SCRIPT: ${{ github.event.inputs.scripts }}
+        run: |
+          if [ -n "$SELECTED_SCRIPT" ]; then
+            case "$SELECTED_SCRIPT" in
+              *[!a-zA-Z0-9._-]*) echo 'Invalid script name'; exit 1 ;;
+            esac
+            sh -n "files/etc/uci-defaults/$SELECTED_SCRIPT"
+            echo "Defaults shell syntax verified"
+          fi
+
       - name: Set SCRIPT environment variable for later steps
         if: ${{ github.event.inputs.scripts }}
         run: echo "SCRIPT=${{ github.event.inputs.scripts }}" >> $GITHUB_ENV
@@ -85,27 +97,6 @@ jobs:
 
           # Export configuration to environment
           cat input_config >> $GITHUB_ENV
-
-      - name: Debug - Show selected script contents
-        if: ${{ github.event.inputs.scripts }}
-        run: |
-          echo "=== Selected Script: ${{ env.SCRIPT }} ==="
-          echo "=== Files in uci-defaults directory ==="
-          ls -la files/etc/uci-defaults/
-          echo "=== Script Contents ==="
-          cat -n files/etc/uci-defaults/${{ env.SCRIPT }}
-
-      - name: Inject secrets into scripts
-        if: ${{ github.event.inputs.scripts }}
-        run: |
-          sed -i \
-            -e 's/^# ssid=".*"/ssid="${{ secrets.WLAN_NAME }}"/' \
-            -e 's/^# ssid_key=".*"/ssid_key="${{ secrets.WLAN_PASS }}"/' \
-            -e 's/^# root_password=".*"/root_password="${{ secrets.ROOT_PASS }}"/' \
-            -e 's/^# pppoe_name=".*"/pppoe_name="${{ secrets.PPPOE_NAME }}"/' \
-            -e 's/^# pppoe_key=".*"/pppoe_key="${{ secrets.PPPOE_PASS }}"/' \
-            -e 's/^# ssh_pubkey=".*"/ssh_pubkey="${{ secrets.SSH_PUBKEY }}"/' \
-            files/etc/uci-defaults/${{ env.SCRIPT }}
 
       - name: Normalize packages and validate DIR-869 A1
         env:
