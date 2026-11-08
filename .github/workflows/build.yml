@@ -323,7 +323,8 @@ jobs:
           set -euo pipefail
           if [[ "$profile" != dlink_dir-869-a1 || "${SCRIPT:-}" != 99-custom ]]; then exit 0; fi
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-user-static proot squashfs-tools
+          sudo apt-get install -y -qq qemu-user-static binfmt-support squashfs-tools
+          sudo update-binfmts --enable qemu-mips
           python3 - <<'PY'
           from pathlib import Path
           import json, subprocess, os
@@ -334,7 +335,8 @@ jobs:
           subprocess.run(['sudo','chown','-R',f'{os.getuid()}:{os.getgid()}','runtime-root'],check=True)
           root = Path('runtime-root')
           for path in ('www/luci-static/resources/view/wireguard-app/status.js','usr/share/rpcd/ucode/luci.fluentdashboard','etc/uci-defaults/99-custom'):
-              assert (root/path).is_file(), 'Firmware file missing: '+path
+              assert (root/path).is_file() and (root/path).stat().st_size > 0, 'Firmware file missing or empty: '+path
+              print('Firmware payload:', path, (root/path).stat().st_size, 'bytes')
           subprocess.run(['node','--check',str(root/'www/luci-static/resources/view/wireguard-app/status.js')],check=True)
           (root/'tmp').mkdir(exist_ok=True)
           (root/'etc/crontabs').mkdir(exist_ok=True)
@@ -344,7 +346,11 @@ jobs:
           print('Verified required files in final SquashFS')
           
           PY
-          PROOT_NO_SECCOMP=1 timeout 180 proot -0 -r "$PWD/runtime-root" -b /dev -b /proc -w / -q /usr/bin/qemu-mips-static /bin/sh /tmp/firmware-smoke.sh 2>&1 | tee firmware-smoke.log
+          sudo cp /usr/bin/qemu-mips-static runtime-root/usr/bin/qemu-mips-static
+          sudo mount --bind /dev runtime-root/dev
+          sudo mount -t proc proc runtime-root/proc
+          trap 'sudo umount runtime-root/proc runtime-root/dev || true' EXIT
+          sudo timeout 180 chroot runtime-root /usr/bin/qemu-mips-static /bin/sh /tmp/firmware-smoke.sh 2>&1 | tee firmware-smoke.log
           cat firmware-smoke.log >> "$GITHUB_STEP_SUMMARY"
 
       - name: Preserve firmware build log
@@ -352,7 +358,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: firmware-build-log
-          path: firmware-build.log
+          path: |
+            firmware-build.log
+            firmware-smoke.log
+            bin/targets/ath79/tiny/*
           if-no-files-found: ignore
 
       - name: Generate build information
