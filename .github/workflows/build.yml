@@ -106,7 +106,7 @@ jobs:
           python3 - <<'PY'
           import os
           items = (os.environ['REQUESTED_PACKAGES'] + ' ' + os.environ['DEVICE_PACKAGES']).split()
-          items = [p for p in items if p not in ('luci-app-wireguard', '-luci-proto-wireguard')]
+          items = [p for p in items if p not in ('-luci-proto-wireguard',)]
           items += ['luci-proto-wireguard']
           if os.environ['profile'] == 'dlink_dir-869-a1':
               if os.environ['target'] != 'ath79/tiny':
@@ -189,6 +189,50 @@ jobs:
             echo '4391596e55ee404aa21634d630a02e40336bb8fdbeee824c16f07511a733b345  packages/luci-mod-fluentdashboard.ipk' | sha256sum -c -
           fi
 
+      - name: Build luci-app-wireguard compatibility UI for OpenWrt 24.10
+        run: |
+          set -euo pipefail
+          if [[ " $packages " == *" luci-app-wireguard "* ]]; then
+            [[ "$openwrt_version" == 24.10.* ]] || exit 1
+            # Repackage the maintained upstream status UI in a separate namespace.
+            # This is a custom compatibility package, not the obsolete 22.03 binary.
+            curl -fL --retry 3 https://raw.githubusercontent.com/openwrt/luci/e6b2055e36d4a23638c3575d6637197494cf3631/protocols/luci-proto-wireguard/htdocs/luci-static/resources/view/wireguard/status.js -o wireguard-status.js
+            node --check wireguard-status.js
+            python3 - <<'PY'
+            import io, json, tarfile
+            from pathlib import Path
+            source = Path('wireguard-status.js').read_bytes()
+            menu = {'admin/status/wireguard-app': {
+                'title': 'WireGuard (App)', 'order': 99,
+                'action': {'type': 'view', 'path': 'wireguard-app/status'},
+                'depends': {'acl': ['luci-proto-wireguard']}}}
+            def archive(entries):
+                out = io.BytesIO()
+                with tarfile.open(fileobj=out, mode='w:gz') as tar:
+                    for name, data in entries.items():
+                        info = tarfile.TarInfo('./' + name)
+                        info.size = len(data)
+                        info.mode = 0o644
+                        tar.addfile(info, io.BytesIO(data))
+                return out.getvalue()
+            data = archive({
+                'www/luci-static/resources/view/wireguard-app/status.js': source,
+                'usr/share/luci/menu.d/luci-app-wireguard.json': json.dumps(menu).encode(),
+                'usr/share/doc/luci-app-wireguard/SOURCE': b'Custom 24.10 compatibility UI. Apache-2.0. Upstream: openwrt/luci e6b2055e36d4a23638c3575d6637197494cf3631. Backend provided by luci-proto-wireguard.\n'})
+            control = ('Package: luci-app-wireguard\nVersion: 24.10-compat-r1\n'
+                       'Architecture: all\nLicense: Apache-2.0\n'
+                       'Maintainer: Trueness04\n'
+                       'Depends: luci-proto-wireguard\n'
+                       'Description: Custom WireGuard status app using maintained OpenWrt 24.10 UI and backend\n'
+                       'Installed-Size: ' + str(len(source) + len(json.dumps(menu))) + '\n')
+            Path('packages/luci-app-wireguard_24.10-compat-r1_all.ipk').write_bytes(
+                archive({'debian-binary': b'2.0\n',
+                         'control.tar.gz': archive({'control': control.encode()}),
+                         'data.tar.gz': data}))
+            print('Built custom luci-app-wireguard compatibility UI with upstream 24.10 backend')
+            PY
+          fi
+
       - name: Build OpenWrt image
         run: |
           set -euo pipefail
@@ -209,8 +253,8 @@ jobs:
           for package in ('luci-proto-wireguard', 'luci-theme-fluent', 'luci-mod-fluentdashboard'):
               if package in os.environ['packages'].split() and not any(line.startswith(package + ' ') for line in manifest.splitlines()):
                   raise SystemExit('Missing requested package: ' + package)
-          if any(line.startswith('luci-app-wireguard ') for line in manifest.splitlines()):
-              raise SystemExit('Obsolete luci-app-wireguard present')
+          if 'luci-app-wireguard' in os.environ['packages'].split() and 'luci-app-wireguard - 24.10-compat-r1' not in manifest:
+              raise SystemExit('Requested compatibility UI missing')
           for image in images:
               size = image.stat().st_size
               print(f'{image.name}: {size} bytes ({size / 1048576:.2f} MiB)')
@@ -247,7 +291,7 @@ jobs:
 
           # Use GitHub Actions environment variables
           GITHUB_REPO="${GITHUB_REPOSITORY}"
-          RELEASE_TAG="${{ env.revision_number }}-${{ github.event.inputs.model }}"
+          RELEASE_TAG="${{ env.revision_number }}-${{ github.event.inputs.model }}-${{ github.run_number }}"
           SHARE_URL="${{ github.event.inputs.share_url }}"
 
 
@@ -293,7 +337,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.event.inputs.model }}-${{ env.openwrt_version }}-${{ env.commit_hash }}
-          tag_name: ${{ env.revision_number }}-${{ github.event.inputs.model }}
+          tag_name: ${{ env.revision_number }}-${{ github.event.inputs.model }}-${{ github.run_number }}
           body_path: build_info.md
           files: ${{ env.image_path }}/*
           make_latest: true
