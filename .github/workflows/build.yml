@@ -45,7 +45,7 @@ jobs:
       - name: Cache build dependencies
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: build-essential file libncurses-dev zlib1g-dev gawk git gettext libssl-dev xsltproc rsync wget unzip python3 python3-distutils aria2
+          packages: build-essential file libncurses-dev zlib1g-dev gawk git gettext libssl-dev xsltproc rsync wget unzip python3 aria2
           version: 1.0
 
       - name: Prepare Build Environment (Scripts & Secrets)
@@ -107,6 +107,40 @@ jobs:
             -e 's/^# ssh_pubkey=".*"/ssh_pubkey="${{ secrets.SSH_PUBKEY }}"/' \
             files/etc/uci-defaults/${{ env.SCRIPT }}
 
+      - name: Normalize packages and validate DIR-869 A1
+        env:
+          REQUESTED_PACKAGES: ${{ github.event.inputs.packages }}
+          DEVICE_PACKAGES: ${{ github.event.inputs.device_packages }}
+        run: |
+          python3 - <<'PY'
+          import os
+          items = (os.environ['REQUESTED_PACKAGES'] + ' ' + os.environ['DEVICE_PACKAGES']).split()
+          items = [p for p in items if p not in ('luci-app-wireguard', '-luci-proto-wireguard')]
+          items += ['luci-proto-wireguard']
+          if os.environ['profile'] == 'dlink_dir-869-a1':
+              if os.environ['target'] != 'ath79/tiny':
+                  raise SystemExit('DIR-869 A1 requires ath79/tiny for OpenWrt 24.10')
+              items += ['luci', 'luci-theme-fluent', 'luci-mod-fluentdashboard', 'wireguard-tools']
+          selected = set(p for p in items if not p.startswith('-'))
+          exclusions = set(p[1:] for p in items if p.startswith('-'))
+          if 'dnsmasq-full' in selected:
+              exclusions.add('dnsmasq')
+          wifi = selected & {'wpad-basic-mbedtls', 'wpad-basic-openssl', 'wpad-mbedtls', 'wpad-openssl', 'wpad-wolfssl', 'wpad', 'wpad-basic-wolfssl'}
+          if len(wifi) > 1:
+              raise SystemExit('Select only one wpad implementation: ' + str(wifi))
+          if wifi:
+              exclusions |= {'wpad-basic-mbedtls', 'wpad-basic-wolfssl', 'wpad-basic-openssl'} - wifi
+          if 'libustream-openssl' in selected:
+              exclusions |= {'libustream-mbedtls', 'libustream-wolfssl'}
+          if 'luci-theme-fluent' in selected:
+              exclusions.add('luci-theme-fluent-lite')
+          selected -= exclusions
+          packages = ' '.join(sorted(selected) + ['-' + p for p in sorted(exclusions)])
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write('packages=' + packages + '\ndevice_packages=\n')
+          print('Resolved packages:', packages)
+          PY
+
       - name: Fetch version buildinfo
         id: fetch_version_buildinfo
         run: |
@@ -149,15 +183,61 @@ jobs:
           TARGET=${{ env.target }} \
           VERSION_PATH=${version_path} ./setup.sh
 
-      - name: Build OpenWrt image
-        continue-on-error: true
+      - name: Extract Image Builder and fetch verified upstream Fluent packages
         run: |
+          set -euo pipefail
           tar xf openwrt-imagebuilder-*.tar.* --strip=1 --no-same-owner -C .
-          make image \
-            PROFILE="${{ env.profile }}" \
-            PACKAGES="${{ env.packages }} ${{ env.device_packages }}" \
-            FILES="${{ env.files }}" \
-            DISABLED_SERVICES="${{ env.disabled_services }}"
+          if [[ " $packages " == *" luci-theme-fluent "* || " $packages " == *" luci-mod-fluentdashboard "* ]]; then
+            [[ "$openwrt_version" == 24.10.* ]] || { echo 'Fluent IPKs require OpenWrt 24.10.x'; exit 1; }
+            mkdir -p packages
+            # Upstream nightly packages pinned by filename AND SHA256; fail if replaced.
+            base=https://github.com/LazuliKao/luci-theme-fluent/releases/download/nightly
+            curl -fL --retry 3 "$base/luci-theme-fluent_1.0.9_p202611081011-r1_all.ipk" -o packages/luci-theme-fluent.ipk
+            curl -fL --retry 3 "$base/luci-mod-fluentdashboard_1.0.9_p202611081011-r5_all.ipk" -o packages/luci-mod-fluentdashboard.ipk
+            echo '0b666f6c4a23aac04db54a9bd3631eea1f1181a1fce76f1a1768494208b181a5  packages/luci-theme-fluent.ipk' | sha256sum -c -
+            echo '4391596e55ee404aa21634d630a02e40336bb8fdbeee824c16f07511a733b345  packages/luci-mod-fluentdashboard.ipk' | sha256sum -c -
+          fi
+
+      - name: Build OpenWrt image
+        run: |
+          set -euo pipefail
+          make image PROFILE="$profile" PACKAGES="$packages $device_packages" FILES="$files" DISABLED_SERVICES="${disabled_services:-}" 2>&1 | tee firmware-build.log
+
+      - name: Validate firmware, manifest and flash budget
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          target = Path('bin/targets') / os.environ['target']
+          profile = os.environ['profile']
+          info = json.loads((target / 'profiles.json').read_text())['profiles'][profile]
+          images = [target / i['name'] for i in info['images'] if i.get('type') in ('sysupgrade', 'factory')]
+          if not images or any(not p.is_file() for p in images):
+              raise SystemExit('Missing flashable firmware image; refusing publication')
+          manifest = next(target.glob('*.manifest')).read_text()
+          for package in ('luci-proto-wireguard', 'luci-theme-fluent', 'luci-mod-fluentdashboard'):
+              if package in os.environ['packages'].split() and not any(line.startswith(package + ' ') for line in manifest.splitlines()):
+                  raise SystemExit('Missing requested package: ' + package)
+          if any(line.startswith('luci-app-wireguard ') for line in manifest.splitlines()):
+              raise SystemExit('Obsolete luci-app-wireguard present')
+          for image in images:
+              size = image.stat().st_size
+              print(f'{image.name}: {size} bytes ({size / 1048576:.2f} MiB)')
+              # tiny.mk: 15872 KiB firmware partition, not the full 16 MiB flash.
+              # Reserve an additional 64 KiB erase block for writable overlay.
+              if profile == 'dlink_dir-869-a1' and size > (15872 - 64) * 1024:
+                  raise SystemExit('DIR-869 A1 flash budget exceeded')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('### Verified firmware sizes\n' + '\n'.join(f'- {p.name}: {p.stat().st_size} bytes' for p in images) + '\n')
+          PY
+
+      - name: Preserve firmware build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-build-log
+          path: firmware-build.log
+          if-no-files-found: ignore
 
       - name: Generate build information
         run: |
