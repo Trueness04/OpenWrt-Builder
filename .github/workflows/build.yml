@@ -199,38 +199,38 @@ jobs:
             curl -fL --retry 3 https://raw.githubusercontent.com/openwrt/luci/e6b2055e36d4a23638c3575d6637197494cf3631/protocols/luci-proto-wireguard/htdocs/luci-static/resources/view/wireguard/status.js -o wireguard-status.js
             node --check wireguard-status.js
             python3 - <<'PY'
-            import io, json, tarfile
-            from pathlib import Path
-            source = Path('wireguard-status.js').read_bytes()
-            menu = {'admin/status/wireguard-app': {
-                'title': 'WireGuard (App)', 'order': 99,
-                'action': {'type': 'view', 'path': 'wireguard-app/status'},
-                'depends': {'acl': ['luci-proto-wireguard']}}}
-            def archive(entries):
-                out = io.BytesIO()
-                with tarfile.open(fileobj=out, mode='w:gz') as tar:
-                    for name, data in entries.items():
-                        info = tarfile.TarInfo('./' + name)
-                        info.size = len(data)
-                        info.mode = 0o644
-                        tar.addfile(info, io.BytesIO(data))
-                return out.getvalue()
-            data = archive({
-                'www/luci-static/resources/view/wireguard-app/status.js': source,
-                'usr/share/luci/menu.d/luci-app-wireguard.json': json.dumps(menu).encode(),
-                'usr/share/doc/luci-app-wireguard/SOURCE': b'Custom 24.10 compatibility UI. Apache-2.0. Upstream: openwrt/luci e6b2055e36d4a23638c3575d6637197494cf3631. Backend provided by luci-proto-wireguard.\n'})
-            control = ('Package: luci-app-wireguard\nVersion: 24.10-compat-r1\n'
-                       'Architecture: all\nLicense: Apache-2.0\n'
-                       'Maintainer: Trueness04\n'
-                       'Depends: luci-proto-wireguard\n'
-                       'Description: Custom WireGuard status app using maintained OpenWrt 24.10 UI and backend\n'
-                       'Installed-Size: ' + str(len(source) + len(json.dumps(menu))) + '\n')
-            Path('packages/luci-app-wireguard_24.10-compat-r1_all.ipk').write_bytes(
-                archive({'debian-binary': b'2.0\n',
-                         'control.tar.gz': archive({'control': control.encode()}),
-                         'data.tar.gz': data}))
-            print('Built custom luci-app-wireguard compatibility UI with upstream 24.10 backend')
-            PY
+          import io, json, tarfile
+          from pathlib import Path
+          source = Path('wireguard-status.js').read_bytes()
+          menu = {'admin/status/wireguard-app': {
+              'title': 'WireGuard (App)', 'order': 99,
+              'action': {'type': 'view', 'path': 'wireguard-app/status'},
+              'depends': {'acl': ['luci-proto-wireguard']}}}
+          def archive(entries):
+              out = io.BytesIO()
+              with tarfile.open(fileobj=out, mode='w:gz') as tar:
+                  for name, data in entries.items():
+                      info = tarfile.TarInfo('./' + name)
+                      info.size = len(data)
+                      info.mode = 0o644
+                      tar.addfile(info, io.BytesIO(data))
+              return out.getvalue()
+          data = archive({
+              'www/luci-static/resources/view/wireguard-app/status.js': source,
+              'usr/share/luci/menu.d/luci-app-wireguard.json': json.dumps(menu).encode(),
+              'usr/share/doc/luci-app-wireguard/SOURCE': b'Custom 24.10 compatibility UI. Apache-2.0. Upstream: openwrt/luci e6b2055e36d4a23638c3575d6637197494cf3631. Backend provided by luci-proto-wireguard.\n'})
+          control = ('Package: luci-app-wireguard\nVersion: 24.10-compat-r1\n'
+                     'Architecture: all\nLicense: Apache-2.0\n'
+                     'Maintainer: Trueness04\n'
+                     'Depends: luci-proto-wireguard\n'
+                     'Description: Custom WireGuard status app using maintained OpenWrt 24.10 UI and backend\n'
+                     'Installed-Size: ' + str(len(source) + len(json.dumps(menu))) + '\n')
+          Path('packages/luci-app-wireguard_24.10-compat-r1_all.ipk').write_bytes(
+              archive({'debian-binary': b'2.0\n',
+                       'control.tar.gz': archive({'control': control.encode()}),
+                       'data.tar.gz': data}))
+          print('Built custom luci-app-wireguard compatibility UI with upstream 24.10 backend')
+          PY
           fi
 
       - name: Build OpenWrt image
