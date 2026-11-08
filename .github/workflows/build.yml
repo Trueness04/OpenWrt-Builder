@@ -50,6 +50,7 @@ jobs:
 
       - name: Prepare Build Environment (Scripts & Secrets)
         run: |
+          export CUSTOM_SCRIPT_CONTENT="$(python3 -c 'import os,base64; s=os.environ.get("CUSTOM_SCRIPT_CONTENT",""); print(base64.b64decode(s[7:],validate=True).decode() if s.startswith("base64:") else s,end="")')"
           chmod +x ./prepare_build.sh
           ./prepare_build.sh "${{ github.event.inputs.scripts }}"
         env:
@@ -71,6 +72,7 @@ jobs:
               *[!a-zA-Z0-9._-]*) echo 'Invalid script name'; exit 1 ;;
             esac
             sh -n "files/etc/uci-defaults/$SELECTED_SCRIPT"
+            python3 -c 'import os,pathlib; s=(pathlib.Path("files/etc/uci-defaults")/os.environ["SELECTED_SCRIPT"]).read_text(); assert not s.startswith("#!") or s.splitlines()[0] in ("#!/bin/sh","#!/bin/bash","#!/bin/ash"), "Defaults shebang flattened by dispatch form"'
             echo "Defaults shell syntax verified"
           fi
 
@@ -189,6 +191,44 @@ jobs:
             echo '4391596e55ee404aa21634d630a02e40336bb8fdbeee824c16f07511a733b345  packages/luci-mod-fluentdashboard.ipk' | sha256sum -c -
           fi
 
+      - name: Fix Fluent dashboard backend for OpenWrt 24.10
+        run: |
+          python3 - <<'PY'
+          import io, tarfile, copy, re
+          from pathlib import Path
+          package = Path('packages/luci-mod-fluentdashboard.ipk')
+          provider = "'use strict';\n\nimport { open, readfile, writefile, rename, unlink, mkdir, rmdir } from 'fs';\nimport { cursor } from 'uci';\n\nimport { rand } from 'math';\n\n// OpenWrt 24.10 has mkdir(), but fs.mkdtemp() is not exported.\nfunction mkdtemp(template) {\n    for (let attempt = 0; attempt < 16; attempt++) {\n        let path = replace(template, /XXXXXX$/, sprintf('%08x-%08x', time(), int(rand() * 2147483647)));\n        if (mkdir(path, 0700)) return path;\n    }\n    return null;\n}\n\nconst config = '/etc/config/fluentdashboard';\nconst max_size = 262144;\nfunction require_value(ok, message) { if (!ok) die(message); }\nfunction integer(v, min, max) { return type(v) == 'int' && v >= min && v <= max; }\nfunction id(v) { return type(v) == 'string' && match(v, /^[A-Za-z0-9_-]{1,64}$/); }\nfunction safe_json(v, depth) {\n\tif (depth > 16) return false;\n\tif (type(v) == 'object' || type(v) == 'array') {\n\t\tfor (let k, item in v) {\n\t\t\tif (k in [ '__proto__', 'constructor', 'prototype' ] || !safe_json(item, depth + 1)) return false;\n\t\t}\n\t}\n\treturn true;\n}\nfunction validate(doc) {\n\trequire_value(type(doc) == 'object' && doc.schemaVersion == 1 && safe_json(doc, 0), 'Invalid schema');\n\trequire_value(integer(doc.revision, 0, 9007199254740990), 'Invalid revision');\n\trequire_value(type(doc.dashboards) == 'array' && length(doc.dashboards) >= 1 && length(doc.dashboards) <= 16, 'Invalid dashboards');\n\tlet dashboards = {};\n\tfor (let dashboard in doc.dashboards) {\n\t\trequire_value(type(dashboard) == 'object' && id(dashboard.id) && !exists(dashboards, dashboard.id), 'Invalid dashboard id');\n\t\tdashboards[dashboard.id] = true;\n\t\trequire_value(type(dashboard.name) == 'string' && length(trim(dashboard.name)) && length(dashboard.name) <= 128, 'Invalid name');\n\t\trequire_value(type(dashboard.nodes) == 'array' && length(dashboard.nodes) <= 120, 'Too many nodes');\n\t\tlet nodes = {};\n\t\tfor (let node in dashboard.nodes) {\n\t\t\trequire_value(type(node) == 'object' && id(node.id) && !exists(nodes, node.id), 'Invalid node id');\n\t\t\tnodes[node.id] = node;\n\t\t\trequire_value(node.kind in [ 'widget', 'group' ] && exists(node, 'parentId') && (node.parentId == null || id(node.parentId)), 'Invalid node');\n\t\t\tfor (let flag in [ 'hidden', 'locked', 'collapsed' ]) require_value(!exists(node, flag) || type(node[flag]) == 'bool', 'Invalid flag');\n\t\t\trequire_value(!exists(node, 'title') || (type(node.title) == 'string' && length(node.title) <= 256), 'Invalid title');\n\t\t\tlet t = node.tile;\n\t\t\trequire_value(type(t) == 'object' && t.size in [ 'small', 'medium', 'wide', 'large', 'xlarge', 'full', 'custom' ], 'Invalid tile');\n\t\t\trequire_value(integer(t.x, 0, 11) && integer(t.y, 0, 10000) && integer(t.w, 1, 12) && integer(t.h, 1, 48) && integer(t.order, 0, 100000), 'Invalid coordinates');\n\t\t\tif (node.kind == 'widget')\n\t\t\t\trequire_value(type(node.widgetType) == 'string' && match(node.widgetType, /^[A-Za-z0-9_.-]{1,128}$/) && integer(node.widgetVersion, 1, 100000) && type(node.config) == 'object', 'Invalid widget');\n\t\t\telse {\n\t\t\t\trequire_value(type(node.title) == 'string', 'Invalid group title');\n\t\t\t\trequire_value(!exists(node, 'description') || (type(node.description) == 'string' && length(node.description) <= 2048), 'Invalid description');\n\t\t\t}\n\t\t}\n\t\tfor (let node in dashboard.nodes) {\n\t\t\tlet seen = {}; seen[node.id] = true;\n\t\t\tlet parent = node.parentId, depth = node.kind == 'group' ? 1 : 0;\n\t\t\twhile (parent != null) {\n\t\t\t\trequire_value(!exists(seen, parent) && nodes[parent]?.kind == 'group', 'Invalid parent graph');\n\t\t\t\tseen[parent] = true;\n\t\t\t\trequire_value(++depth <= 2, 'Too many group levels');\n\t\t\t\tparent = nodes[parent].parentId;\n\t\t\t}\n\t\t\trequire_value(node.tile.x + node.tile.w <= (node.parentId == null ? 12 : nodes[node.parentId].tile.w), 'Tile outside parent');\n\t\t}\n\t}\n\trequire_value(type(doc.defaultDashboardId) == 'string' && exists(dashboards, doc.defaultDashboardId), 'Invalid default dashboard');\n\trequire_value(!exists(doc, 'meta') || type(doc.meta) == 'object', 'Invalid metadata');\n}\n\nfunction load_document() {\n\tconst uci = cursor('/etc/config', '/var/lock', '');\n\trequire_value(uci.load('fluentdashboard'), 'Cannot read dashboard configuration');\n\tlet raw = uci.get('fluentdashboard', 'global', 'layout');\n\tlet revision = int(uci.get('fluentdashboard', 'global', 'revision'));\n\trequire_value(integer(revision, 0, 9007199254740990), 'Invalid stored revision');\n\tif (!raw && revision == 0) return { document: null, revision: 0 };\n\trequire_value(type(raw) == 'string' && length(raw) <= max_size, 'Invalid stored layout');\n\tlet doc = json(raw);\n\tvalidate(doc);\n\trequire_value(doc.revision == revision, 'Stored revision mismatch');\n\treturn { document: doc, revision };\n}\n\nfunction save_document(args) {\n\trequire_value(type(args.layout) == 'string' && length(args.layout) <= max_size, 'Layout too large');\n\tlet doc = json(args.layout);\n\tvalidate(doc);\n\trequire_value(integer(args.expectedRevision, 0, 9007199254740989) && doc.revision == args.expectedRevision, 'Invalid expected revision');\n\tconst current = load_document();\n\tif (current.revision != args.expectedRevision) return { error: 'conflict', revision: current.revision };\n\tdoc.revision = current.revision + 1;\n\t// Isolated UCI cursor: no global /tmp/.uci deltas, commit then atomic same-filesystem rename.\n\tconst staging = mkdtemp('/etc/config/.fluentdashboard-XXXXXX');\n\trequire_value(staging, 'Cannot create staging directory');\n\tlet result;\n\ttry {\n\t\tconst old = readfile(config);\n\t\trequire_value(old != null && writefile(staging + '/fluentdashboard', old) == length(old), 'Cannot stage config');\n\t\tconst uci = cursor(staging, staging, '');\n\t\trequire_value(uci.load('fluentdashboard'), 'Cannot load staged config');\n\t\trequire_value(uci.set('fluentdashboard', 'global', 'layout', sprintf('%J', doc)) && uci.set('fluentdashboard', 'global', 'revision', sprintf('%d', doc.revision)) && uci.set('fluentdashboard', 'global', 'schema_version', '1'), 'Cannot set config');\n\t\trequire_value(uci.commit('fluentdashboard'), 'Cannot commit config');\n\t\trequire_value(writefile(staging + '/previous', old) == length(old) && rename(staging + '/previous', config + '.previous'), 'Cannot preserve previous config');\n\t\trequire_value(rename(staging + '/fluentdashboard', config), 'Cannot publish config');\n\t\tresult = { document: doc, revision: doc.revision };\n\t} catch (error) { result = { error: 'storage', message: `${error}` }; }\n\tunlink(staging + '/fluentdashboard'); unlink(staging + '/previous'); rmdir(staging);\n\treturn result;\n}\n\nreturn {\n\t'luci.fluentdashboard': {\n\t\tload: { call: function() { try { return load_document(); } catch (error) { return { error: 'corrupt', message: `${error}` }; } } },\n\t\tsave: {\n\t\t\targs: { layout: '', expectedRevision: 0 },\n\t\t\tcall: function(request) {\n\t\t\t\tconst lock = open('/var/lock/fluentdashboard.lock', 'a', 0600);\n\t\t\t\tif (!lock) return { error: 'storage', message: 'Cannot open lock' };\n\t\t\t\tif (!lock.lock('xn')) { lock.close(); return { error: 'busy', message: 'Another save is in progress' }; }\n\t\t\t\tlet result;\n\t\t\t\ttry { result = save_document(request.args); } catch (error) { result = { error: 'invalid', message: `${error}` }; }\n\t\t\t\tlock.close();\n\t\t\t\treturn result;\n\t\t\t}\n\t\t}\n\t}\n};\n"
+          def rewrite(raw, change):
+              output = io.BytesIO()
+              with tarfile.open(fileobj=io.BytesIO(raw), mode='r:*') as src, tarfile.open(fileobj=output, mode='w:gz') as dst:
+                  for item in src:
+                      member = copy.copy(item)
+                      data = src.extractfile(item).read() if item.isfile() else None
+                      if data is not None:
+                          data = change(item.name.lstrip('./'), data)
+                          member.size = len(data)
+                      dst.addfile(member, io.BytesIO(data) if data is not None else None)
+              return output.getvalue()
+          def data_patch(name, data):
+              if name == 'usr/share/rpcd/ucode/luci.fluentdashboard':
+                  assert b'mkdtemp' in data
+                  return provider.encode()
+              return data
+          def control_patch(name, data):
+              if name == 'control':
+                  text = re.sub(r'^Version: .*$', 'Version: 1.0.9_p202611081011-r6', data.decode(), flags=re.M)
+                  text = re.sub(r'^Depends: (.*)$', r'Depends: \1, ucode-mod-math', text, flags=re.M)
+                  return text.encode()
+              return data
+          def outer_patch(name, data):
+              if name == 'data.tar.gz': return rewrite(data, data_patch)
+              if name == 'control.tar.gz': return rewrite(data, control_patch)
+              return data
+          package.write_bytes(rewrite(package.read_bytes(), outer_patch))
+          print('Patched Fluent provider for OpenWrt 24.10 fs API')
+          
+          PY
+
       - name: Build luci-app-wireguard compatibility UI for OpenWrt 24.10
         run: |
           set -euo pipefail
@@ -209,6 +249,14 @@ jobs:
           def archive(entries):
               out = io.BytesIO()
               with tarfile.open(fileobj=out, mode='w:gz') as tar:
+                  directories = set()
+                  for name in entries:
+                      directories.update(str(parent) for parent in Path(name).parents if str(parent) != '.')
+                  for directory in sorted(directories, key=lambda p: (p.count('/'), p)):
+                      info = tarfile.TarInfo('./' + directory)
+                      info.type = tarfile.DIRTYPE
+                      info.mode = 0o755
+                      tar.addfile(info)
                   for name, data in entries.items():
                       info = tarfile.TarInfo('./' + name)
                       info.size = len(data)
@@ -219,13 +267,13 @@ jobs:
               'www/luci-static/resources/view/wireguard-app/status.js': source,
               'usr/share/luci/menu.d/luci-app-wireguard.json': json.dumps(menu).encode(),
               'usr/share/doc/luci-app-wireguard/SOURCE': b'Custom 24.10 compatibility UI. Apache-2.0. Upstream: openwrt/luci e6b2055e36d4a23638c3575d6637197494cf3631. Backend provided by luci-proto-wireguard.\n'})
-          control = ('Package: luci-app-wireguard\nVersion: 24.10-compat-r1\n'
+          control = ('Package: luci-app-wireguard\nVersion: 24.10-compat-r2\n'
                      'Architecture: all\nLicense: Apache-2.0\n'
                      'Maintainer: Trueness04\n'
                      'Depends: luci-proto-wireguard\n'
                      'Description: Custom WireGuard status app using maintained OpenWrt 24.10 UI and backend\n'
                      'Installed-Size: ' + str(len(source) + len(json.dumps(menu))) + '\n')
-          Path('packages/luci-app-wireguard_24.10-compat-r1_all.ipk').write_bytes(
+          Path('packages/luci-app-wireguard_24.10-compat-r2_all.ipk').write_bytes(
               archive({'debian-binary': b'2.0\n',
                        'control.tar.gz': archive({'control': control.encode()}),
                        'data.tar.gz': data}))
@@ -237,6 +285,10 @@ jobs:
         run: |
           set -euo pipefail
           make image PROFILE="$profile" PACKAGES="$packages $device_packages" FILES="$files" DISABLED_SERVICES="${disabled_services:-}" 2>&1 | tee firmware-build.log
+          if grep -E 'Collected errors:| \* wfopen:' firmware-build.log; then
+            echo 'Package extraction failed; refusing publication'
+            exit 1
+          fi
 
       - name: Validate firmware, manifest and flash budget
         run: |
@@ -253,7 +305,7 @@ jobs:
           for package in ('luci-proto-wireguard', 'luci-theme-fluent', 'luci-mod-fluentdashboard'):
               if package in os.environ['packages'].split() and not any(line.startswith(package + ' ') for line in manifest.splitlines()):
                   raise SystemExit('Missing requested package: ' + package)
-          if 'luci-app-wireguard' in os.environ['packages'].split() and 'luci-app-wireguard - 24.10-compat-r1' not in manifest:
+          if 'luci-app-wireguard' in os.environ['packages'].split() and 'luci-app-wireguard - 24.10-compat-r2' not in manifest:
               raise SystemExit('Requested compatibility UI missing')
           for image in images:
               size = image.stat().st_size
@@ -265,6 +317,35 @@ jobs:
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
               f.write('### Verified firmware sizes\n' + '\n'.join(f'- {p.name}: {p.stat().st_size} bytes' for p in images) + '\n')
           PY
+
+      - name: Test final firmware files, MIPS defaults, LED control and live RPC
+        run: |
+          set -euo pipefail
+          if [[ "$profile" != dlink_dir-869-a1 || "${SCRIPT:-}" != 99-custom ]]; then exit 0; fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static proot squashfs-tools
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, subprocess, os
+          image = next(Path('bin/targets/ath79/tiny').glob('*dlink_dir-869-a1-squashfs-sysupgrade.bin'))
+          offset = image.read_bytes().find(b'hsqs')
+          assert offset > 0
+          subprocess.run(['sudo','unsquashfs','-no-xattrs','-no-progress','-o',str(offset),'-d','runtime-root',str(image)],check=True)
+          subprocess.run(['sudo','chown','-R',f'{os.getuid()}:{os.getgid()}','runtime-root'],check=True)
+          root = Path('runtime-root')
+          for path in ('www/luci-static/resources/view/wireguard-app/status.js','usr/share/rpcd/ucode/luci.fluentdashboard','etc/uci-defaults/99-custom'):
+              assert (root/path).is_file(), 'Firmware file missing: '+path
+          subprocess.run(['node','--check',str(root/'www/luci-static/resources/view/wireguard-app/status.js')],check=True)
+          (root/'tmp').mkdir(exist_ok=True)
+          (root/'etc/crontabs').mkdir(exist_ok=True)
+          (root/'tmp/firmware-smoke.sh').write_text("#!/bin/sh\nset -e\nfail() { echo \"SMOKE FAIL: $*\"; exit 1; }\n[ -s /www/luci-static/resources/view/wireguard-app/status.js ] || fail 'missing WireGuard JS'\n[ -s /usr/share/rpcd/ucode/luci.fluentdashboard ] || fail 'missing Fluent provider'\n[ \"$(wc -l </etc/uci-defaults/99-custom)\" -gt 100 ] || fail 'defaults lost line breaks'\nmkdir -p /tmp/sysinfo /var/lock /var/run /sys/class/leds/white:power /sys/class/leds/orange:power\necho 'dlink,dir-869-a1' >/tmp/sysinfo/board_name\nfor role in MASTER STA; do\n  for order in normal reversed; do\n    rm -f /etc/dir869-defaults-v2.done /etc/config/role_sta\n    [ \"$role\" != STA ] || touch /etc/config/role_sta\n    cat >/etc/config/system <<'CONF'\nconfig system\n option hostname 'OpenWrt'\nconfig timeserver 'ntp'\nCONF\n    cat >/etc/config/network <<'CONF'\nconfig globals 'globals'\n option ula_prefix 'fd00::/48'\nconfig interface 'lan'\n option device 'br-lan'\n option proto 'static'\n option ipaddr '192.168.1.1'\nconfig interface 'wan'\n option device 'eth0.2'\n option proto 'dhcp'\nconfig interface 'wan6'\n option device '@wan'\n option proto 'dhcpv6'\nCONF\n    cat >/etc/config/dhcp <<'CONF'\nconfig dnsmasq\nconfig dhcp 'lan'\n option interface 'lan'\nCONF\n    if [ \"$order\" = normal ]; then b0=5g; b1=2g; r5=radio0; r2=radio1; else b0=2g; b1=5g; r5=radio1; r2=radio0; fi\n    cat >/etc/config/wireless <<CONF\nconfig wifi-device 'radio0'\n option type 'mac80211'\n option band '$b0'\n option disabled '1'\nconfig wifi-device 'radio1'\n option type 'mac80211'\n option band '$b1'\n option disabled '1'\nconfig wifi-iface 'default_radio0'\n option device 'radio0'\n option ssid 'OpenWrt'\n option disabled '1'\nconfig wifi-iface 'default_radio1'\n option device 'radio1'\n option ssid 'OpenWrt'\n option disabled '1'\nCONF\n    echo '1 1 * * * echo preserved' >/etc/crontabs/root\n    /bin/sh /etc/uci-defaults/99-custom || { cat /tmp/uci-defaults-dir869.log; fail \"defaults $role $order\"; }\n    [ -f /etc/dir869-defaults-v2.done ] || fail 'missing completion marker'\n    [ \"$(uci get wireless.dir869_5g.device)\" = \"$r5\" ] || fail 'wrong 5 GHz radio'\n    [ \"$(uci get wireless.$r5.disabled)\" = 0 ] || fail '5 GHz disabled'\n    [ \"$(uci get wireless.dir869_5g.ssid)\" = 5WiFi ] || fail 'wrong SSID'\n    [ \"$(uci get system.@system[0].zonename)\" = Asia/Tehran ] || fail 'wrong timezone'\n    [ \"$(uci get system.dir869_white.sysfs)\" = white:power ] || fail 'wrong LED'\n    grep -q 'dir869-led off' /etc/crontabs/root || fail 'night LED missing'\n    grep -q 'echo preserved' /etc/crontabs/root || fail 'cron overwritten'\n    [ -s /etc/owut.d/99-dir869 ] || fail 'upgrade defaults missing'\n    [ -s /etc/rc.d/S97dir869-led ] || fail 'LED startup not enabled'\n    if [ \"$role\" = MASTER ]; then\n      [ \"$(uci get network.wan.device)\" = eth0.2 ] || fail 'WAN mapping lost'\n      [ \"$(uci get wireless.$r2.disabled)\" = 0 ] || fail '2 GHz disabled'\n      [ \"$(uci get wireless.dir869_2g.ssid)\" = 2WiFi ] || fail '2 GHz SSID'\n      [ \"$(uci get network.lan.ipaddr)\" = 192.168.1.1 ] || fail 'master LAN'\n    else\n      [ \"$(uci get wireless.dir869_5g.mode)\" = sta ] || fail 'wrong station mode'\n      [ \"$(uci get wireless.dir869_5g.ifname)\" = dir869-sta ] || fail 'unstable station name'\n      [ \"$(uci get wireless.dir869_5g.wds)\" = 1 ] || fail 'WDS missing'\n      [ \"$(uci get dhcp.lan.ignore)\" = 1 ] || fail 'station DHCP enabled'\n      [ \"$(uci get network.lan.ipaddr)\" = 192.168.1.2 ] || fail 'station LAN'\n    fi\n    /usr/sbin/dir869-led off\n    [ \"$(cat /sys/class/leds/white:power/brightness)\" = 0 ] || fail 'LED off failed'\n    /usr/sbin/dir869-led on\n    [ \"$(cat /sys/class/leds/white:power/trigger)\" = default-on ] || fail 'LED on failed'\n    before=\"$(uci export wireless)\"\n    /bin/sh /etc/uci-defaults/99-custom\n    [ \"$(uci export wireless)\" = \"$before\" ] || fail 'repeat run changed settings'\n    echo \"PASS: $role $order radios, Wi-Fi, WAN/DHCP, LEDs, cron, upgrade copy, idempotency\"\n  done\ndone\n/sbin/ubusd -s /tmp/ubus-smoke.sock >/tmp/ubusd-smoke.log 2>&1 &\nubusd_pid=$!\nsleep 1\n/sbin/rpcd -s /tmp/ubus-smoke.sock >/tmp/rpcd-smoke.log 2>&1 &\nrpcd_pid=$!\ntrap 'kill \"$rpcd_pid\" \"$ubusd_pid\" \"${http_pid:-}\" 2>/dev/null || true' EXIT\nfor count in 1 2 3 4 5 6 7 8 9 10; do\n  /bin/ubus -s /tmp/ubus-smoke.sock list luci.fluentdashboard | grep -q '^luci.fluentdashboard$' && break\n  sleep 1\ndone\n/bin/ubus -s /tmp/ubus-smoke.sock list luci.fluentdashboard | grep -q '^luci.fluentdashboard$' || { cat /tmp/rpcd-smoke.log; fail 'Fluent RPC not registered'; }\n/bin/ubus -s /tmp/ubus-smoke.sock call luci.fluentdashboard load '{}' >/tmp/fluent-load.json\n[ \"$(jsonfilter -i /tmp/fluent-load.json -e '@.revision')\" = 0 ] || { cat /tmp/fluent-load.json; fail 'Fluent load failed'; }\n/bin/ubus -s /tmp/ubus-smoke.sock call luci.fluentdashboard save \"$(cat /tmp/fluent-save.json)\" >/tmp/fluent-save-result.json\n[ \"$(jsonfilter -i /tmp/fluent-save-result.json -e '@.revision')\" = 1 ] || { cat /tmp/fluent-save-result.json; fail 'Fluent save failed'; }\n/bin/ubus -s /tmp/ubus-smoke.sock call luci.fluentdashboard load '{}' >/tmp/fluent-load.json\n[ \"$(jsonfilter -i /tmp/fluent-load.json -e '@.revision')\" = 1 ] || fail 'Fluent reload failed'\necho 'PASS: actual MIPS rpcd registered luci.fluentdashboard; load/save/reload succeeded'\n/usr/sbin/uhttpd -f -p 127.0.0.1:18080 -h /www >/tmp/uhttpd-smoke.log 2>&1 &\nhttp_pid=$!\nsleep 1\nuclient-fetch -q -O /tmp/wireguard-http.js http://127.0.0.1:18080/luci-static/resources/view/wireguard-app/status.js\ncmp /tmp/wireguard-http.js /www/luci-static/resources/view/wireguard-app/status.js || fail 'WireGuard HTTP response mismatch'\necho 'PASS: actual MIPS uhttpd served WireGuard JS over HTTP'\n")
+          doc = dict(schemaVersion=1,revision=0,dashboards=[dict(id='main',name='Main',nodes=[])],defaultDashboardId='main')
+          (root/'tmp/fluent-save.json').write_text(json.dumps(dict(layout=json.dumps(doc),expectedRevision=0)))
+          print('Verified required files in final SquashFS')
+          
+          PY
+          PROOT_NO_SECCOMP=1 timeout 180 proot -0 -r "$PWD/runtime-root" -b /dev -b /proc -w / -q /usr/bin/qemu-mips-static /bin/sh /tmp/firmware-smoke.sh 2>&1 | tee firmware-smoke.log
+          cat firmware-smoke.log >> "$GITHUB_STEP_SUMMARY"
 
       - name: Preserve firmware build log
         if: always()
