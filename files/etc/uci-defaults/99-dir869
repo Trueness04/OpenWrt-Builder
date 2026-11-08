@@ -1,0 +1,176 @@
+#!/bin/sh
+# DIR-869 A1 / OpenWrt 24.10: first-boot defaults.
+# Credentials are injected by the build environment, never committed here.
+set -eu
+umask 077
+exec >>/tmp/uci-defaults-dir869.log 2>&1
+
+marker=/etc/dir869-defaults-v1.done
+[ ! -e "$marker" ] || exit 0
+[ "$(cat /tmp/sysinfo/board_name)" = "dlink,dir-869-a1" ] || {
+    echo "Unsupported board; refusing network changes"
+    exit 1
+}
+
+root_password=""
+ssid_key=""
+# root_password=""
+# ssid_key=""
+
+# Validate BEFORE changing the network. Never enable an unsecured AP.
+[ -n "$root_password" ] || { echo "Missing root password"; exit 1; }
+[ "${#ssid_key}" -ge 8 ] && [ "${#ssid_key}" -le 63 ] || {
+    echo "Wi-Fi passphrase must contain 8 to 63 characters"
+    exit 1
+}
+
+ROLE=MASTER
+case "$(uci -q get system.@system[0].hostname || true)" in
+    *[sS][tT][aA]*) ROLE=STA ;;
+esac
+[ ! -f /etc/config/role_sta ] || ROLE=STA
+
+# Discover radios by their device section, never by wifi-iface array index.
+[ -s /etc/config/wireless ] || wifi config
+. /lib/functions.sh
+radio2g=
+radio5g=
+find_radio() {
+    local section="$1" band hwmode
+    config_get band "$section" band
+    config_get hwmode "$section" hwmode
+    case "$band:$hwmode" in
+        2g:*|:11g) radio2g="$section" ;;
+        5g:*|:11a) radio5g="$section" ;;
+    esac
+}
+config_load wireless
+config_foreach find_radio wifi-device
+[ -n "$radio2g" ] && [ -n "$radio5g" ] || {
+    echo "Both 2.4 and 5 GHz radios are required"
+    exit 1
+}
+# Do not remove board-specific physical WAN mapping.
+if [ "$ROLE" = MASTER ]; then
+    [ -n "$(uci -q get network.wan.device || uci -q get network.wan.ifname || true)" ] || {
+        echo "Physical WAN mapping missing; refusing incomplete configuration"
+        exit 1
+    }
+fi
+
+printf '%s\n%s\n' "$root_password" "$root_password" | passwd root >/dev/null 2>&1
+unset root_password
+
+uci set luci.main.mediaurlbase='/luci-static/fluent'
+uci set system.@system[0].zonename='Asia/Tehran'
+uci set system.@system[0].timezone='<+0330>-3:30'
+uci set system.ntp=timeserver
+uci set system.ntp.enabled='1'
+uci -q delete system.ntp.server || true
+for server in 0.pool.ntp.org 1.pool.ntp.org time.cloudflare.com; do
+    uci add_list system.ntp.server="$server"
+done
+uci -q delete network.globals.ula_prefix || true
+uci set network.lan.proto='static'
+uci set network.lan.netmask='255.255.255.0'
+uci -q delete network.lan.dns || true
+
+if [ "$ROLE" = MASTER ]; then
+    uci set system.@system[0].hostname='router'
+    uci set network.lan.ipaddr='192.168.1.1'
+    uci -q delete network.lan.gateway || true
+    uci set network.wan.proto='dhcp'
+    uci -q delete network.wan.username || true
+    uci -q delete network.wan.password || true
+    uci set network.wan.peerdns='0'
+    uci -q delete network.wan.dns || true
+    uci add_list network.wan.dns='1.1.1.1'
+    uci add_list network.wan.dns='8.8.8.8'
+    uci set dhcp.lan.ignore='0'
+    uci -q delete dhcp.lan.dhcpv4 || true
+    uci -q del_list dhcp.@dnsmasq[0].rebind_domain='dns.msftncsi.com' || true
+    uci add_list dhcp.@dnsmasq[0].rebind_domain='dns.msftncsi.com'
+    # Hostname registration; no fixed address was supplied.
+    uci set dhcp.dir869_tizentube=host
+    uci set dhcp.dir869_tizentube.name='tizentube'
+    uci set dhcp.dir869_tizentube.mac='F0:70:4F:68:33:96'
+else
+    uci set system.@system[0].hostname='router-sta'
+    uci set network.lan.ipaddr='192.168.1.2'
+    uci set network.lan.gateway='192.168.1.1'
+    uci add_list network.lan.dns='192.168.1.1'
+    uci -q delete network.wan || true
+    uci -q delete network.wan6 || true
+    uci set dhcp.lan.ignore='1'
+    uci set dhcp.lan.dhcpv4='disabled'
+    uci set dhcp.lan.dhcpv6='disabled'
+    uci set dhcp.lan.ra='disabled'
+    uci set dhcp.lan.ndp='disabled'
+fi
+
+# Replace only interfaces attached to these two radios.
+remove_iface() {
+    local section="$1" device
+    config_get device "$section" device
+    case "$device" in
+        "$radio2g"|"$radio5g") uci -q delete "wireless.$section" || true ;;
+    esac
+}
+config_foreach remove_iface wifi-iface
+for radio in "$radio2g" "$radio5g"; do
+    uci set "wireless.$radio.country=IR"
+    uci set "wireless.$radio.disabled=0"
+    uci set "wireless.$radio.cell_density=0"
+    uci set "wireless.$radio.channel=auto"
+done
+uci set "wireless.$radio2g.htmode=HT20"
+uci set "wireless.$radio2g.channels=1 6 11"
+# Restrict WDS to non-DFS low channels; regulatory database enforces IR limits.
+uci set "wireless.$radio5g.channel=36"
+uci set "wireless.$radio5g.htmode=VHT80"
+
+add_iface() {
+    local name="$1" radio="$2" mode="$3" ssid="$4"
+    uci set "wireless.$name=wifi-iface"
+    uci set "wireless.$name.device=$radio"
+    uci set "wireless.$name.network=lan"
+    uci set "wireless.$name.mode=$mode"
+    uci set "wireless.$name.ssid=$ssid"
+    uci set "wireless.$name.encryption=psk2"
+    uci set "wireless.$name.key=$ssid_key"
+    uci set "wireless.$name.disabled=0"
+    uci set "wireless.$name.wpa_group_rekey=86400"
+}
+if [ "$ROLE" = MASTER ]; then
+    add_iface dir869_2g "$radio2g" ap 2WiFi
+    add_iface dir869_5g "$radio5g" ap 5WiFi
+    uci set wireless.dir869_5g.wds='1'
+else
+    # One 5 GHz WDS uplink prevents an L2 loop between the same two bridges.
+    uci set "wireless.$radio2g.disabled=1"
+    uci set "wireless.$radio5g.channel=auto"
+    add_iface dir869_5g "$radio5g" sta 5WiFi
+    uci set wireless.dir869_5g.wds='1'
+fi
+unset ssid_key
+
+# Keep existing rc.local and cron jobs intact. No forced RAM cache eviction.
+# Only schedule a power/status LED that actually exists on this board.
+mkdir -p /etc/crontabs
+touch /etc/crontabs/root
+sed -i '/# dir869-led$/d' /etc/crontabs/root
+for led in white:power white:status blue:status; do
+    [ -e "/sys/class/leds/$led/brightness" ] || continue
+    printf '0 23 * * * echo 0 > /sys/class/leds/%s/brightness # dir869-led\n' "$led" >>/etc/crontabs/root
+    printf '0 7 * * * echo 1 > /sys/class/leds/%s/brightness # dir869-led\n' "$led" >>/etc/crontabs/root
+    break
+done
+
+for package in luci system network dhcp wireless; do
+    uci commit "$package"
+done
+# Defaults run during boot: do not restart network/firewall mid-configuration.
+# OpenWrt applies committed settings as services start.
+touch "$marker"
+echo "DIR-869 defaults complete: $ROLE"
+exit 0
